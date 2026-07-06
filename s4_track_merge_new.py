@@ -47,8 +47,8 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
 OUTPUT_ROOT = r"H:\data_v4\厦门市"
-START_DATE = "2022-07-02"  # 起始日期
-END_DATE = "2022-08-31"  # 结束日期
+START_DATE = "2022-09-01"  # 起始日期
+END_DATE = "2022-09-30"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
