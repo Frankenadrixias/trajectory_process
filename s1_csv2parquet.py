@@ -144,7 +144,7 @@ def process_file(args: Tuple[Path, Path, str]) -> Tuple[bool, str, str]:
         df.sort_values("Userid", kind="mergesort", inplace=True)
 
         # 保存为Parquet
-        df.to_parquet(output_file, engine="pyarrow", compression="snappy", index=False)
+        df.to_parquet(output_file, engine="pyarrow", compression='zstd', index=False)
         logger.info(f"完成: [{category}] {output_file.name}")
 
         # 释放内存

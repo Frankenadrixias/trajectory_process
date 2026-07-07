@@ -10,13 +10,12 @@
 import os
 import gc
 import logging
-import psutil
 import pandas as pd
 import time
 import warnings
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
 """
 输入：data_v3
@@ -54,25 +53,22 @@ OUTPUT_DIR = r"H:\data_v4\厦门市\Merge_v0"
 USER_FILE = r"H:\data_v3\厦门市\Users.feather"
 START_DATE = "2023-01-01"  # 起始日期
 END_DATE = "2023-06-30"  # 结束日期
+
+# 内存控制参数
+GROUP_SIZE = 200000  # 用户处理批次大小，根据公共用户数确定
+PROCESSES = 1  # 每批处理的日期数，一般根据电脑内存设定，保证每天的完整4套数据可以读进内存
+THREADS_PER_DAY = 12  # 每个日期进程内的线程数
+# =========== 一般仅需要修改以上内容 ===========
+
+# 初始化存储变量
 COMMON_USERS: set[str]  # 用于 isin / in 判断从属
 COMMON_USER_LIST: list[str]  # 用于分组 / chunk
 N_USERS: int
-
-# 内存控制参数
-MAX_CPU_USAGE = 0.9  # 最大cpu使用比例 (90%)
-MIN_FREE_MEMORY = 8  # 最小空闲内存(GB)
-TOTAL_MEMORY = psutil.virtual_memory().total / (1024**3)  # 设备内存大小
-GROUP_SIZE = 200000  # 用户处理批次大小
-PROCESSES = 1
-# PROCESSES = int((TOTAL_MEMORY - MIN_FREE_MEMORY) / 24)  # 每批处理的日期数
-THREADS_PER_DAY = 12
-# THREADS_PER_DAY = max(6, int(MAX_CPU_USAGE * cpu_count() / PROCESSES) - 1)  # 每个日期进程内的线程数
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
-# ==========================================
 
 
 # 创建目录（如果不存在）
@@ -94,7 +90,7 @@ def init_worker_common_users(user_file: Path, user_col: str):
 
     del df
     gc.collect()
-    logger.info(f"[PID {os.getpid()}] Loaded COMMON_USERS: {N_USERS}")
+    logger.info(f"[PID {os.getpid()}] 进程加载公共用户: {N_USERS}")
 
 
 # 用户 group 生成器
@@ -106,7 +102,8 @@ def iter_user_groups(user_list: list[str], group_size: int):
 
 
 # 处理单日数据：加载数据、处理用户组、处理未注册用户
-def process_single_day(day):
+# 输入参数：当日日期字符串
+def process_single_day(day: str):
     logger.info(f"处理日期: {day}")
     day_start = time.time()
     global COMMON_USERS, COMMON_USER_LIST, N_USERS
@@ -115,6 +112,7 @@ def process_single_day(day):
     try:
         paths = [os.path.join(INPUT_DIR, d, f"{day}.parquet") for d in
                  ["Timing", "SceneReco", "WifiConnect", "WifiStable"]]
+        # 读取4类数据，只选择必要的列
         df_timing, df_scene, df_wifi_c, df_wifi_s =\
             [pd.read_parquet(p, engine="pyarrow", dtype_backend="pyarrow",
                              columns=['Userid', 'lng', 'lat', 'starttime', 'endtime']) for p in paths]
@@ -151,7 +149,7 @@ def process_single_day(day):
             if rest_parts:
                 # 合并数据、排序并保存
                 merged = pd.concat(rest_parts).sort_values(["Userid", "starttime", "endtime"])
-                merged.to_parquet(rest_path, index=False)
+                merged.to_parquet(rest_path, engine="pyarrow", compression='zstd', index=False)
                 logger.info(f"[{day}] 保存其他用户数据: {len(merged)} 行")
             else:
                 pd.DataFrame().to_parquet(rest_path)
@@ -169,7 +167,8 @@ def process_single_day(day):
 
 
 # 线程函数：处理单个用户组
-def process_user_group(args):
+# 输入参数：日期，用户组id和对应df，四类数据df，输出路径
+def process_user_group(args: tuple):
     day, idx, user_group, df_timing, df_scene, df_wifi_c, df_wifi_s, day_output_dir = args
     start_time = time.time()
     group_name = f"group_{idx}"
@@ -178,7 +177,7 @@ def process_user_group(args):
         out_path = os.path.join(day_output_dir, f"{group_name}.parquet")
         # 跳过已处理文件
         if os.path.exists(out_path):
-            logger.info(f"[{day}][{group_name}] Skipped (already exists)")
+            logger.info(f"[{day}][{group_name}] 文件已存在，跳过")
             return
         # 筛选并合并数据
         merged_parts = []
@@ -192,20 +191,21 @@ def process_user_group(args):
         # 合并 + 排序，保存结果
         if merged_parts:
             merged = pd.concat(merged_parts).sort_values(["Userid", "starttime", "endtime"])
-            merged.to_parquet(out_path, index=False)
-            logger.info(f"[{day}][{group_name}] Done ({len(merged)} rows, {time.time() - start_time:.1f}s)")
+            merged.to_parquet(out_path, engine="pyarrow", compression='zstd', index=False)
+            logger.info(f"[{day}][{group_name}] 完成 ({len(merged)} 行, {time.time() - start_time:.1f}s)")
             del merged
         # 空数据处理
         else:
-            logger.info(f"[{day}][{group_name}] Empty (0 rows)")
             pd.DataFrame().to_parquet(out_path)
+            logger.info(f"[{day}][{group_name}] 为空 (0 rows)")
 
     except Exception as e:
-        logger.error(f"[{day}][{group_name}] Error: {str(e)}", exc_info=True)
+        logger.error(f"[{day}][{group_name}] 错误: {str(e)}", exc_info=True)
 
     del merged_parts
 
 
+# 主进程
 def main():
     logger.info("===== Program started =====")
     create_dir(OUTPUT_DIR)
@@ -213,6 +213,7 @@ def main():
     # 生成日期列表
     all_dates = pd.date_range(start=START_DATE, end=END_DATE, freq="D").strftime("%Y-%m-%d").tolist()
     logger.info(f"处理日期范围: {all_dates}")
+    logger.info(f"使用 {PROCESSES} 进程开始处理...")
 
     # 分批次处理
     with Pool(
