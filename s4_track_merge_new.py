@@ -149,27 +149,72 @@ def clean_user_track(df, params: JumpFilterParams) -> tuple[pd.DataFrame, pd.Dat
 
 # 生成按小时打断后的明细记录
 # 功能：仅在跨整点时拆分时间段，不跨整点的记录完整保留
-def hour_break(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. 生成每行的“内部整点切分点”
-    df["split_points"] = [get_split_points(s, e) for s, e in zip(df["starttime"], df["endtime"])]
+def hour_break(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
 
-    # 2. 构造每行的区间端点：[start, ..., end]，不跨整点 -> [start, end]后面只生成 1 行
-    df["bounds"] = [[s] + pts + [e] for s, pts, e in zip(df["starttime"], df["split_points"], df["endtime"])]
+    # 1. 转换目标日期边界，利用原生时间戳进行极速范围判断
+    target_start = pd.to_datetime(day_str)
+    target_end = target_start + pd.Timedelta(days=1)
 
-    # 3. 生成区间对 (start_i, end_i)
-    df["intervals"] = [list(zip(b[:-1], b[1:])) for b in df["bounds"]]
+    # 2. 提前过滤，只保留与目标日期有重叠的记录，大幅减小后续计算规模
+    df = df[(df["starttime"] < target_end) & (df["endtime"] >= target_start)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=df.columns)
 
-    # 4. 展开为多行
-    expanded = df.explode("intervals", ignore_index=True)
-    expanded[["starttime", "endtime"]] = pd.DataFrame(expanded["intervals"].tolist(), index=expanded.index)
+    # 3. 计算每个区间的起点和终点所在的整点
+    s_hour = df["starttime"].dt.floor("h")
+    e_hour = df["endtime"].dt.floor("h")
 
-    # 5. 计算停留时间（分钟）
-    expanded["staytime"] = (expanded["endtime"] - expanded["starttime"]).dt.total_seconds() / 60
+    # 4. 计算每个区间跨越的整点数（即需要拆分出的额外段数）
+    s_hour_np = s_hour.to_numpy(copy=False)
+    e_hour_np = e_hour.to_numpy(copy=False)
 
-    # 6. 清理中间字段，导出
-    expanded = expanded.drop(columns=["split_points", "bounds", "intervals"])
-    expanded = expanded.sort_values(["Userid", "starttime"], kind="mergesort").reset_index(drop=True)
+    # 转换为秒再除以 3600 秒（1小时），得到跨越的整点小时差
+    diff_seconds = (e_hour_np - s_hour_np).astype("timedelta64[s]").astype(np.int64)
+    num_splits = (diff_seconds // 3600).astype(np.int32)
+
+    # 5. 行复制：利用 repeat 快速复制行，彻底消灭 .explode()
+    repeats = num_splits + 1
+    expanded = df.loc[df.index.repeat(repeats)].reset_index(drop=True)
+
+    # 6. 向量化生成组内序号 j (0, 1, 2...)，完全规避 GroupBy
+    n = repeats.sum()
+    r_cumsum = np.cumsum(repeats)
+    out = np.ones(n, dtype=np.int32)
+    out[0] = 0
+    if len(repeats) > 1:
+        out[r_cumsum[:-1]] = 1 - repeats[:-1]
+    j = np.cumsum(out)
+
+    # 7. 向量化计算拆分后的区间起止点（极速数学填充）
+    orig_start = expanded["starttime"].to_numpy(copy=False)
+    orig_end = expanded["endtime"].to_numpy(copy=False)
+    repeated_s_hour = np.repeat(s_hour_np, repeats)
+
+    j_timedelta = j.astype("timedelta64[h]")
+    next_j_timedelta = (j + 1).astype("timedelta64[h]")
+
+    # 用 max/min 算术直接算出拆分时间，速度达到硬件极限
+    expanded["starttime"] = np.maximum(orig_start, repeated_s_hour + j_timedelta)
+    expanded["endtime"] = np.minimum(orig_end, repeated_s_hour + next_j_timedelta)
+
+    # 8. 过滤只属于目标日期的行 (使用原生时间戳快速比对，替代慢速的 .dt.date == target)
+    expanded = expanded[(expanded["starttime"] >= target_start) & (expanded["starttime"] < target_end)].copy()
+    if expanded.empty:
+        return pd.DataFrame(columns=df.columns)
+
+    # 9. 计算停留时间（分钟），使用最轻量的 NumPy 减法
+    expanded["staytime"] = (
+            (expanded["endtime"].to_numpy(copy=False) - expanded["starttime"].to_numpy(copy=False))
+            .astype("timedelta64[s]")
+            .astype(np.float64) / 60.0
+    )
+
+    # 10. 提取 hour 和 date
+    expanded["date"] = target_start.date()
     expanded["hour"] = expanded["starttime"].dt.hour + 1
+
+    # 11. 最终排序归整
+    expanded = expanded.sort_values(["Userid", "starttime"], kind="mergesort").reset_index(drop=True)
 
     return expanded
 
@@ -179,7 +224,7 @@ def hour_break(df: pd.DataFrame) -> pd.DataFrame:
 def main_process(file_tuple):
 
     # 读取数据
-    input_file, outfile_0, outfile_a, outfile_b = file_tuple
+    day_str, input_file, outfile_0, outfile_a, outfile_b = file_tuple
     data = pd.read_parquet(input_file, engine="pyarrow", dtype_backend="pyarrow")
     data = data.sort_values(["Userid", "starttime"], kind="mergesort").reset_index(drop=True)
     if "priority" not in data.columns:
@@ -193,27 +238,23 @@ def main_process(file_tuple):
     except Exception as trans_e:
         # 如果转换失败，程序继续运行，但保持原类型
         logger.warning(f"类型转换警告: {trans_e}")
-    data.to_parquet(outfile_0, engine="pyarrow", compression='zstd', index=False)
+    data.to_parquet(outfile_0, engine="pyarrow", compression="zstd", index=False)
 
     # 2. 按小时打断记录
-    data_expanded = hour_break(data_cleaned)
+    data_expanded = hour_break(data_cleaned, day_str)
     try:
         data_expanded["staytime"] = data_expanded["staytime"].astype("float[pyarrow]")
         data_expanded["hour"] = data_expanded["hour"].astype("int16[pyarrow]")
     except Exception as trans_e:
         # 如果转换失败，程序继续运行，但保持原类型
         logger.warning(f"类型转换警告: {trans_e}")
-    data_expanded.to_parquet(outfile_a, engine="pyarrow", compression='zstd', index=False)
+    data_expanded.to_parquet(outfile_a, engine="pyarrow", compression="zstd", index=False)
 
     # 3. 时间插值
     # 步骤1: 每个用户在每个小时内，只保留即精度最高且时间最长的代表点
     data_sorted = data_expanded.sort_values(by=["Userid", "hour", "priority", "staytime"],
                                             ascending=[True, True, False, False])  # 场景 > wifi > 定位
     data = data_sorted.drop_duplicates(subset=["Userid", "hour"], keep="first").reset_index(drop=True)
-
-    # 提前在小表上提取日期，建立哈希映射表，避免后续在大表上进行慢速分组
-    data["date"] = data["starttime"].dt.date
-    user_to_date = data.set_index("Userid")["date"]
 
     # 步骤2: 向量化创建完整小时骨架序列
     all_users = data["Userid"].unique()
@@ -227,46 +268,64 @@ def main_process(file_tuple):
     # 步骤3: 合并完整骨架序列与实际数据
     merged = pd.merge(
         full_combinations,
-        data[["Userid", "hour", "lng", "lat", "x", "y", "starttime"]],
+        data[["Userid", "hour", "lng", "lat", "x", "y"]],
         on=["Userid", "hour"],
         how="left",
     )
-    # 在执行线性插值前，如果 starttime 缺失，说明该小时是新填充的骨架（即属于插值数据）
-    merged["is_moving"] = merged["starttime"].isna().astype("bool[pyarrow]")
+    # 在执行线性插值前，如果经纬度缺失，说明该小时是新填充的骨架（即属于插值数据）
+    merged["is_moving"] = merged["lng"].isna().astype("bool[pyarrow]")
 
-    # 步骤4: 向量化插值处理
-    '''
-    numeric_cols = ["lng", "lat", "x", "y"]
-    merged[numeric_cols] = merged.groupby("Userid")[numeric_cols].transform(
-        lambda g: g.interpolate(method="linear", limit_direction="both")
-    )
-    '''
-
+    # 步骤4: 向量化插值处理（替代原始lambda方法）
     # 构造辅助列记录有观测的小时
-    merged['observed_hour'] = np.where(merged['starttime'].notna(), merged['hour'], np.nan)  
-    grp = merged.groupby("Userid")  # 全局分组对象
+    observed_hour = pd.Series(
+        np.where(~merged["is_moving"], merged["hour"], np.nan),
+        index=merged.index
+    )
 
-    last_hour = grp['observed_hour'].ffill()
-    next_hour = grp['observed_hour'].bfill()
+    # 对局部 Series 执行分组前向/后向填充
+    grp = merged.groupby("Userid")  # 全局分组对象
+    last_hour = observed_hour.groupby(merged["Userid"]).ffill()
+    next_hour = observed_hour.groupby(merged["Userid"]).bfill()
+
+    # 计算插值权重
     denom = next_hour - last_hour
     denom_safe = np.where(denom == 0, 1.0, denom)  # 防除以0
     weight = (merged['hour'] - last_hour) / denom_safe
-    numeric_cols = ["lng", "lat", "x", "y"]
+
     # 极速向量化计算 4 个数值列的线性插值
+    numeric_cols = ["lng", "lat", "x", "y"]
     for col in numeric_cols:
         last_val = grp[col].ffill()
         next_val = grp[col].bfill()
         merged[col] = last_val + weight * (next_val - last_val)
 
+    # 补齐两端边界空缺
+    merged[numeric_cols] = grp[numeric_cols].ffill()  # 补齐末观测之后
+    merged[numeric_cols] = merged.groupby("Userid")[numeric_cols].bfill()  # 补齐首观测之前
+
     # 步骤5: 将经纬度转换为H3网格索引
-    coords = merged[["lat", "lng"]].drop_duplicates()
+    # 提取唯一坐标并显式过滤空值
+    coords = merged[["lat", "lng"]].dropna(subset=["lat", "lng"]).drop_duplicates()
+    # 仅对极少数唯一坐标进行 H3 计算
     coords["h3_grid"] = [
-        h3.latlng_to_cell(lat, lng, H3_RESOLUTION) for lat, lng in zip(coords["lat"].values, coords["lng"].values)
+        h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
+        for lat, lng in zip(coords["lat"].to_numpy(copy=False), coords["lng"].to_numpy(copy=False))
     ]
-    merged = merged.merge(coords, on=["lat", "lng"], how="left")
+    # 构建 (lat, lng) -> h3_grid 的原生 Python 映射字典
+    h3_dict = dict(
+        zip(
+            zip(coords["lat"].to_numpy(copy=False), coords["lng"].to_numpy(copy=False)),
+            coords["h3_grid"].to_numpy(copy=False)
+        )
+    )
+    # 利用原生字典的 C 级哈希查找直接广播回大表，规避缓慢的 Pandas 浮点数 merge 关联
+    merged["h3_grid"] = [
+        h3_dict.get((lat, lng))
+        for lat, lng in zip(merged["lat"].to_numpy(copy=False), merged["lng"].to_numpy(copy=False))
+    ]
 
     # 步骤6: 添加日期列并选择输出字段
-    merged["date"] = merged["Userid"].map(user_to_date)
+    merged["date"] = pd.to_datetime(day_str).date()
     result = merged[["Userid", "date", "hour", "lng", "lat", "x", "y", "h3_grid", "is_moving"]]
 
     # 保存结果
@@ -339,7 +398,7 @@ def run_parallel(input_dir, output_root, start_date=None, end_date=None, max_wor
                 skipped_count += 1
                 continue
 
-            tasks.append((str(f_path), str(out0), str(outA), str(outB)))
+            tasks.append((day_name, str(f_path), str(out0), str(outA), str(outB)))
 
         if not tasks:
             logger.info(f"日期 {day_name}: 所有文件已存在，跳过。")
