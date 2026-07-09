@@ -47,14 +47,15 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
 OUTPUT_ROOT = r"H:\data_v4\厦门市"
-START_DATE = "2022-09-01"  # 起始日期
-END_DATE = "2022-09-30"  # 结束日期
+START_DATE = "2022-10-03"  # 起始日期
+END_DATE = "2022-10-03"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
 H3_RESOLUTION = 9
 MAX_CPU_USAGE = 0.8  # 最大cpu使用比例 (90%)
 NUM_WORKERS = min(int(MAX_CPU_USAGE * cpu_count()), 12)  # 根据 CPU 核心数和内存设定进程数
+priority_map = {"wifi": 2, "scene": 3, "timing": 1}  # 数据类型权重表
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -181,6 +182,8 @@ def main_process(file_tuple):
     input_file, outfile_0, outfile_a, outfile_b = file_tuple
     data = pd.read_parquet(input_file, engine="pyarrow", dtype_backend="pyarrow")
     data = data.sort_values(["Userid", "starttime"], kind="mergesort").reset_index(drop=True)
+    if "priority" not in data.columns:
+        data["priority"] = data["ftype"].map(priority_map).fillna(0).astype("int16[pyarrow]")
 
     # 1. 去除异常点
     (data_cleaned, data) = clean_user_track(data, params=JumpFilterParams())
@@ -203,8 +206,14 @@ def main_process(file_tuple):
     data_expanded.to_parquet(outfile_a, engine="pyarrow", compression='zstd', index=False)
 
     # 3. 时间插值
-    idx = data_expanded.groupby(["Userid", "hour"], observed=True)["staytime"].idxmax()
-    data = data_expanded.loc[idx].reset_index(drop=True)
+    # 步骤1: 每个用户在每个小时内，只保留即精度最高且时间最长的代表点
+    data_sorted = data_expanded.sort_values(by=["Userid", "hour", "priority", "staytime"],
+                                            ascending=[True, True, False, False])  # 场景 > wifi > 定位
+    data = data_sorted.drop_duplicates(subset=["Userid", "hour"], keep="first").reset_index(drop=True)
+
+    # 提前在小表上提取日期，建立哈希映射表，避免后续在大表上进行慢速分组
+    data["date"] = data["starttime"].dt.date
+    user_to_date = data.set_index("Userid")["date"]
 
     # 步骤2: 向量化创建完整小时骨架序列
     all_users = data["Userid"].unique()
@@ -218,22 +227,38 @@ def main_process(file_tuple):
     # 步骤3: 合并完整骨架序列与实际数据
     merged = pd.merge(
         full_combinations,
-        data[["Userid", "hour", "lng", "lat", "x", "y", "plabel", "starttime"]],
+        data[["Userid", "hour", "lng", "lat", "x", "y", "starttime"]],
         on=["Userid", "hour"],
         how="left",
     )
+    # 在执行线性插值前，如果 starttime 缺失，说明该小时是新填充的骨架（即属于插值数据）
+    merged["is_moving"] = merged["starttime"].isna().astype("bool[pyarrow]")
 
     # 步骤4: 向量化插值处理
+    '''
     numeric_cols = ["lng", "lat", "x", "y"]
     merged[numeric_cols] = merged.groupby("Userid")[numeric_cols].transform(
         lambda g: g.interpolate(method="linear", limit_direction="both")
     )
+    '''
 
-    # --- 5. 处理非数值列 (如 plabel) ---
-    # plabel（地点标签）无法线性插值，通常使用“最近邻填充”，这里先 bfill (向后找补前面) 再 ffill
-    merged["plabel"] = merged.groupby("Userid")["plabel"].transform(lambda g: g.bfill().ffill())
+    # 构造辅助列记录有观测的小时
+    merged['observed_hour'] = np.where(merged['starttime'].notna(), merged['hour'], np.nan)  
+    grp = merged.groupby("Userid")  # 全局分组对象
 
-    # 将经纬度转换为H3网格索引
+    last_hour = grp['observed_hour'].ffill()
+    next_hour = grp['observed_hour'].bfill()
+    denom = next_hour - last_hour
+    denom_safe = np.where(denom == 0, 1.0, denom)  # 防除以0
+    weight = (merged['hour'] - last_hour) / denom_safe
+    numeric_cols = ["lng", "lat", "x", "y"]
+    # 极速向量化计算 4 个数值列的线性插值
+    for col in numeric_cols:
+        last_val = grp[col].ffill()
+        next_val = grp[col].bfill()
+        merged[col] = last_val + weight * (next_val - last_val)
+
+    # 步骤5: 将经纬度转换为H3网格索引
     coords = merged[["lat", "lng"]].drop_duplicates()
     coords["h3_grid"] = [
         h3.latlng_to_cell(lat, lng, H3_RESOLUTION) for lat, lng in zip(coords["lat"].values, coords["lng"].values)
@@ -241,11 +266,8 @@ def main_process(file_tuple):
     merged = merged.merge(coords, on=["lat", "lng"], how="left")
 
     # 步骤6: 添加日期列并选择输出字段
-    merged["date"] = merged.groupby("Userid")["starttime"].transform("first").dt.date
-    result = merged[["Userid", "date", "hour", "lng", "lat", "x", "y", "h3_grid"]]
-
-    # 清理临时列
-    result = result.drop(columns=["first_valid"], errors="ignore")
+    merged["date"] = merged["Userid"].map(user_to_date)
+    result = merged[["Userid", "date", "hour", "lng", "lat", "x", "y", "h3_grid", "is_moving"]]
 
     # 保存结果
     result.to_parquet(outfile_b, engine="pyarrow", compression='zstd', index=False)

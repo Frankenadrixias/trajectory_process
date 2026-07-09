@@ -8,6 +8,7 @@
 @Desc    :   对同一天用户的轨迹进行空间聚类、按聚类进行合并，保留最长区间
 """
 import os
+import h3
 import time
 import logging
 import warnings
@@ -17,7 +18,7 @@ from glob import glob
 from tqdm import tqdm
 from pyproj import Transformer, CRS
 from sklearn.cluster import DBSCAN
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
 """
 输入：data_v4/Merge_v0
@@ -53,11 +54,12 @@ START_DATE = "2022-12-01"  # 起始日期
 END_DATE = "2022-12-31"  # 结束日期
 
 # 参数配置
-MAX_CPU_USAGE = 0.6  # 最大cpu使用比例 (90%)
-# NUM_WORKERS = max(int(MAX_CPU_USAGE * cpu_count()), 8)  # 进程数
-NUM_WORKERS = 11
+NUM_WORKERS = 11  # 进程数
+GROUP_METHOD = "dbscan"  # 可选 "dbscan"（通过DBSCAN聚类plabel合并） 或 "h3"（直接按H3网格合并）
+H3_RESOLUTION = 9  # H3分辨率，可根据需要调整
 DBSCAN_MODEL = DBSCAN(eps=100, min_samples=2, algorithm="ball_tree", n_jobs=-1)  # DBSCAN参数
-priority_map = {"wifi": 3, "scene": 2, "timing": 1}
+priority_map = {"wifi": 2, "scene": 3, "timing": 1}  # 数据类型权重表
+# =========== 一般仅需要修改以上内容 ===========
 
 # 指定 Albers 等积投影坐标系
 albers_crs = "+proj=aea +lat_1=25 +lat_2=47 +lat_0=36 +lon_0=105 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs"
@@ -67,7 +69,6 @@ transformer = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_proj4(albers_cr
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
-# ==========================================
 
 
 # 创建目录（如果不存在）
@@ -77,19 +78,20 @@ def create_dir(path):
 
 
 # 优化后的时间段合并函数（O(n)复杂度）
-# 输入参数：含有位置属性列（如聚类类别、所属网格等）的df、位置属性列名
-# 输出：
-def merge_time(df: pd.DataFrame, col_name: str, priority_col: str = "priority") -> pd.DataFrame:
+# 输入参数：含有位置属性列（如聚类类别、所属网格等）的df、位置属性列名、数据优先级属性、容差时间
+# 输出参数：记录合并后的df
+def merge_time(df: pd.DataFrame, col_label: str, priority_col: str = "priority", time_gap: int = 5) -> pd.DataFrame:
     if df.empty:
         return df
 
     # 一次性排序：group + time，确保每个组内的时间是顺序的
-    df = df.sort_values([col_name, "starttime"], kind="mergesort").reset_index(drop=True)
-    group_vals = df[col_name].to_numpy(copy=False)
+    df = df.sort_values([col_label, "starttime"], kind="mergesort").reset_index(drop=True)
+    group_vals = df[col_label].to_numpy(copy=False)
     starts = df["starttime"].to_numpy(copy=False)
     ends = df["endtime"].to_numpy(copy=False)
     priorities = df[priority_col].to_numpy(copy=False)  # 优先级数组
     length = len(df)
+    gap_threshold = np.timedelta64(time_gap, 'm')
 
     # 预分配结果数组
     out_idx = np.empty(length, dtype=np.int32)
@@ -119,8 +121,8 @@ def merge_time(df: pd.DataFrame, col_name: str, priority_col: str = "priority") 
             anchor_idx = i
             continue
 
-        # 同一 group，执行区间合并逻辑
-        if starts[i] <= current_end:
+        # 同一 group，执行区间合并逻辑（含容差判定）
+        if starts[i] <= current_end + gap_threshold:
             # 扩展当前区间
             if ends[i] > current_end:
                 current_end = ends[i]
@@ -149,7 +151,6 @@ def merge_time(df: pd.DataFrame, col_name: str, priority_col: str = "priority") 
     result = df.iloc[out_idx[:out_count]].reset_index(drop=True)
     result["starttime"] = merged_starts[:out_count]
     result["endtime"] = merged_ends[:out_count]
-    result.drop(columns=[priority_col], errors="ignore", inplace=True)
 
     return result
 
@@ -157,28 +158,26 @@ def merge_time(df: pd.DataFrame, col_name: str, priority_col: str = "priority") 
 # 处理单个文件的函数
 def process_single_file(args):
 
-    # 读取数据
     input_file, output_dir = args
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, os.path.basename(input_file))
     if os.path.exists(output_file):
         return
 
+    # 读取数据
     df = pd.read_parquet(input_file, engine='pyarrow', dtype_backend='pyarrow',
                          columns=['Userid', 'lng', 'lat', 'starttime', 'endtime', 'ftype'])
-    df["priority"] = df["ftype"].map(priority_map).fillna(0)
+    df["priority"] = df["ftype"].map(priority_map).fillna(0).astype("int16[pyarrow]")
 
-    # 预处理时间字段
-    # df["starttime"] = pd.to_datetime(df["starttime"])
-    # df["endtime"] = pd.to_datetime(df["endtime"])
-
-    # 全局填充并校正 endtime
+    # 对于空值 endtime 进行全局填充
     df["endtime"] = df["endtime"].fillna(df["starttime"])
-    df["endtime"] = np.maximum(df["endtime"], df["starttime"])
 
-    # 过滤过长停留点
-    # staytime = (df["endtime"] - df["starttime"]).dt.total_seconds() / 60
-    # df = df[~((staytime > 600) & (df["ftype"].isin(["wifi", "scene"])))]
+    # 针对 Timing 数据，单独赋予 1 分钟的默认持续时长
+    timing_mask = df["ftype"] == "timing"
+    df.loc[timing_mask, "endtime"] = df.loc[timing_mask, "starttime"] + pd.Timedelta(minutes=1)
+
+    # 确保所有数据的 endtime 都不小于 starttime
+    df["endtime"] = np.maximum(df["endtime"], df["starttime"])
 
     # 向量化坐标转换
     lons = df["lng"].to_numpy(copy=False)
@@ -187,31 +186,44 @@ def process_single_file(args):
     df["x"] = xs.astype(np.float32)  # 使用float32减少内存
     df["y"] = ys.astype(np.float32)
 
+    # 如果选择 "h3" 分组方式，提前在循环外进行全局唯一坐标 H3 转换
+    if GROUP_METHOD == "h3":
+        coords = df[["lat", "lng"]].drop_duplicates()
+        coords["h3_grid"] = [
+            h3.latlng_to_cell(lat, lng, H3_RESOLUTION) 
+            for lat, lng in zip(coords["lat"].values, coords["lng"].values)
+        ]
+        df = df.merge(coords, on=["lat", "lng"], how="left")
+
     # 处理每个用户
     results = []
     for uid, user_data in df.groupby("Userid", sort=False):
 
-        # DBSCAN聚类
-        coords = user_data[["x", "y"]].values
-        if len(coords) < DBSCAN_MODEL.min_samples:
-            labels = np.arange(len(coords), dtype=np.int32)
-        else:
-            try:
-                labels = DBSCAN_MODEL.fit_predict(coords)
-            except Exception:  # 如果失败，给所有点分配唯一标签
+        if GROUP_METHOD == "dbscan":  # DBSCAN聚类
+            coords = user_data[["x", "y"]].values
+            if len(coords) < DBSCAN_MODEL.min_samples:
                 labels = np.arange(len(coords), dtype=np.int32)
-        labels = labels.astype(np.int32)
+            else:
+                try:
+                    labels = DBSCAN_MODEL.fit_predict(coords)
+                except Exception:  # 如果失败，给所有点分配唯一标签
+                    labels = np.arange(len(coords), dtype=np.int32)
+            labels = labels.astype(np.int32)
 
-        # 高效处理噪声点（向量化操作）
-        noise_mask = labels == -1
-        num_noise = np.count_nonzero(noise_mask)  # 使用向量化操作一次性生成所有标签
-        if num_noise:
-            # 为噪声点分配唯一负值
-            labels[noise_mask] = np.arange(-1, -num_noise - 1, -1, dtype=np.int32)
-        user_data = user_data.assign(plabel=labels)  # 赋值标签
+            # 高效处理噪声点（向量化操作）
+            noise_mask = labels == -1
+            num_noise = np.count_nonzero(noise_mask)  # 使用向量化操作一次性生成所有标签
+            if num_noise:
+                # 为噪声点分配唯一负值
+                labels[noise_mask] = np.arange(-1, -num_noise - 1, -1, dtype=np.int32)
+            user_data = user_data.assign(plabel=labels)  # 赋值标签
 
-        # 对同一聚类内的数据进行结果合并：保留最长区间
-        ws_merged = merge_time(user_data, "plabel", "priority")
+            # 对同一聚类内的数据进行结果合并：保留最长区间
+            ws_merged = merge_time(user_data, "plabel", "priority", 5)
+        
+        else:  # 直接按 H3 网格合并
+            ws_merged = merge_time(user_data, "h3_grid", "priority", 5)
+
         results.append(ws_merged)
 
     if results:
