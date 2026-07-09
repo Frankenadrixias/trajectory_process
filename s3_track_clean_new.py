@@ -169,15 +169,19 @@ def process_single_file(args):
                          columns=['Userid', 'lng', 'lat', 'starttime', 'endtime', 'ftype'])
     df["priority"] = df["ftype"].map(priority_map).fillna(0).astype("int16[pyarrow]")
 
-    # 对于空值 endtime 进行全局填充
-    df["endtime"] = df["endtime"].fillna(df["starttime"])
+    # 删除经纬度异常数据
+    df = df.dropna(subset=['lng', 'lat'])
+    df = df[(df['lng'] != 0) & (df['lat'] != 0)]
+
+    # 过滤非法起始结束时间
+    df = df.dropna(subset=['starttime'])  # 删除 starttime 为空的行
+    df["endtime"] = df["endtime"].fillna(df["starttime"])  # endtime 为空则用 starttime 填充
+    mask = df['endtime'] < df['starttime']  # 确保所有数据的 endtime 都不小于 starttime
+    df.loc[mask, ['starttime', 'endtime']] = df.loc[mask, ['endtime', 'starttime']].values
 
     # 针对 Timing 数据，单独赋予 1 分钟的默认持续时长
     timing_mask = df["ftype"] == "timing"
     df.loc[timing_mask, "endtime"] = df.loc[timing_mask, "starttime"] + pd.Timedelta(minutes=1)
-
-    # 确保所有数据的 endtime 都不小于 starttime
-    df["endtime"] = np.maximum(df["endtime"], df["starttime"])
 
     # 向量化坐标转换
     lons = df["lng"].to_numpy(copy=False)

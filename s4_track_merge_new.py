@@ -47,12 +47,13 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
 OUTPUT_ROOT = r"H:\data_v4\厦门市"
-START_DATE = "2022-10-03"  # 起始日期
-END_DATE = "2022-10-03"  # 结束日期
+START_DATE = "2022-10-01"  # 起始日期
+END_DATE = "2022-10-01"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
 H3_RESOLUTION = 9
+MIN_VALID_HOURS = 5
 MAX_CPU_USAGE = 0.8  # 最大cpu使用比例 (90%)
 NUM_WORKERS = min(int(MAX_CPU_USAGE * cpu_count()), 12)  # 根据 CPU 核心数和内存设定进程数
 priority_map = {"wifi": 2, "scene": 3, "timing": 1}  # 数据类型权重表
@@ -93,7 +94,7 @@ def get_split_points(start, end):
 # 返回：
 # - cleaned_df: 去除异常点后的DataFrame
 # - df: 含is_outlier标记的完整DataFrame
-def clean_user_track(df, params: JumpFilterParams) -> tuple[pd.DataFrame, pd.DataFrame]:
+def clean_user_track(df: pd.DataFrame, params: JumpFilterParams) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     # 1. 计算位移和速度
     group_obj = df.groupby("Userid", sort=False)
@@ -112,7 +113,10 @@ def clean_user_track(df, params: JumpFilterParams) -> tuple[pd.DataFrame, pd.Dat
     df["is_far"] = df["dist_center"] > params.far_thresh_m
 
     # 4. 远离段逻辑判定
-    df["far_seg"] = df["is_far"].ne(df["is_far"].shift()).cumsum()
+    # 只要用户改变 或 远离状态改变，均强制切分并生成全局唯一的段 ID，阻断多用户粘连
+    state_change = df["Userid"].ne(df["Userid"].shift()) | df["is_far"].ne(df["is_far"].shift())
+    df["far_seg"] = state_change.astype("int64[pyarrow]").cumsum()
+
     far_mask = df["is_far"]  # 仅对 is_far 为 True 的段进行统计
     if not far_mask.any():
         # 情况 A: 如果全天都没有远离市中心的点
@@ -121,7 +125,7 @@ def clean_user_track(df, params: JumpFilterParams) -> tuple[pd.DataFrame, pd.Dat
         # 情况 B: 存在远离点，进行段聚合计算
         seg_stats = (
             df[far_mask]
-            .groupby("far_seg")
+            .groupby("far_seg")  # 此时各用户的段 ID 是全局唯一的，可以直接 groupby
             .agg(
                 start_time=("starttime", "first"),
                 end_time=("starttime", "last"),
@@ -209,14 +213,106 @@ def hour_break(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
             .astype(np.float64) / 60.0
     )
 
-    # 10. 提取 hour 和 date
-    expanded["date"] = target_start.date()
+    # 10. 提取 hour，排序归整
     expanded["hour"] = expanded["starttime"].dt.hour + 1
-
-    # 11. 最终排序归整
     expanded = expanded.sort_values(["Userid", "starttime"], kind="mergesort").reset_index(drop=True)
+    expanded = expanded[["Userid", "hour", "lng", "lat", "x", "y", "starttime", "endtime", "staytime", "priority"]]
 
     return expanded
+
+
+# 对按小时打断的轨迹数据执行用户过滤、24小时时空骨架线性插值、以及H3编码还原。
+def interpolate_data(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
+    """
+    :param df: 膨胀后的轨迹 DataFrame，需包含 ['Userid', 'hour', 'priority', 'staytime', 'lng', 'lat', 'x', 'y']
+    :param day_str: 当前 Parquet 文件对应的日期字符串，例如 '2024-01-01'
+    :return: 经过24h插值和H3网格转换后的规范轨迹 DataFrame
+    """
+
+    # 步骤 1: 筛选与去重（每个用户在每个小时内，只保留精度最高且时间最长的代表点）
+    data_sorted = df.sort_values(by=["Userid", "hour", "priority", "staytime"],
+                                 ascending=[True, True, False, False])
+    data = data_sorted.drop_duplicates(subset=["Userid", "hour"], keep="first").reset_index(drop=True)
+
+    # 筛选出满足阈值的有效用户
+    user_hours = data["Userid"].value_counts()
+    valid_users = user_hours[user_hours >= MIN_VALID_HOURS].index
+    data = data[data["Userid"].isin(valid_users)].reset_index(drop=True)
+
+    # 步骤 2: 向量化创建 24 小时骨架
+    all_users = data["Userid"].unique()
+    full_combinations = pd.MultiIndex.from_product([all_users, range(1, 25)], names=["Userid", "hour"]).to_frame(
+        index=False
+    ).astype({
+        "Userid": "string[pyarrow]",
+        "hour": "int16[pyarrow]"
+    })
+
+    # 步骤 3: 骨架与观测数据对齐
+    merged = pd.merge(
+        full_combinations,
+        data[["Userid", "hour", "lng", "lat", "x", "y"]],
+        on=["Userid", "hour"],
+        how="left",
+    )
+    # 如果经度缺失，说明该小时是新填充的骨架（属于插值/移动中数据）
+    merged["is_moving"] = merged["lng"].isna().astype("bool[pyarrow]")
+
+    # 步骤 4: 向量化时空约束线性插值
+    # 构造内存级局部辅助 Series，记录原始有观测的小时
+    observed_hour = pd.Series(
+        np.where(~merged["is_moving"], merged["hour"], np.nan),
+        index=merged.index
+    )
+
+    # 对局部 Series 执行极速分组前向/后向填充时间锚点
+    grp = merged.groupby("Userid")  # 全局分组对象
+    last_hour = observed_hour.groupby(merged["Userid"]).ffill()
+    next_hour = observed_hour.groupby(merged["Userid"]).bfill()
+
+    # 计算插值比例权重
+    denom = next_hour - last_hour
+    denom_safe = np.where(denom == 0, 1.0, denom)  # 防除以 0 警告
+    weight = (merged['hour'] - last_hour) / denom_safe
+
+    # 计算 4 个数值列的线性插值
+    numeric_cols = ["lng", "lat", "x", "y"]
+    for col in numeric_cols:
+        last_val = grp[col].ffill()
+        next_val = grp[col].bfill()
+        merged[col] = last_val + weight * (next_val - last_val)
+
+    # 补齐首尾两端边界空白
+    merged[numeric_cols] = grp[numeric_cols].ffill()
+    merged[numeric_cols] = merged.groupby("Userid")[numeric_cols].bfill()
+
+    # 步骤 5: 向量化经纬度 H3 网格转换
+    # 提取唯一坐标并过滤空值，安全防范 NAType 报错
+    coords = merged[["lat", "lng"]].dropna(subset=["lat", "lng"]).drop_duplicates()
+
+    # 仅在非重复坐标集合上运行 H3 转换，极大减少计算开销
+    coords["h3_grid"] = [
+        h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
+        for lat, lng in zip(coords["lat"].to_numpy(copy=False), coords["lng"].to_numpy(copy=False))
+    ]
+    # 构建高兼容性的哈希映射字典
+    h3_dict = dict(
+        zip(
+            zip(coords["lat"].to_numpy(copy=False), coords["lng"].to_numpy(copy=False)),
+            coords["h3_grid"].to_numpy(copy=False)
+        )
+    )
+    # 将结果广播回大表，彻底规避缓慢的 Pandas 浮点 merge 关联
+    merged["h3_grid"] = [
+        h3_dict.get((lat, lng))
+        for lat, lng in zip(merged["lat"].to_numpy(copy=False), merged["lng"].to_numpy(copy=False))
+    ]
+
+    # 步骤 6: 日期广播与字段格式化
+    merged["date"] = pd.to_datetime(day_str).date()
+    result = merged[["Userid", "date", "hour", "lng", "lat", "x", "y", "h3_grid", "is_moving"]]
+
+    return result
 
 
 # 主处理流程：基于Merge_v1生成Merge_v1a（去除异常点）、Merge_v2a（按小时打断）、Merge_v2b（逐小时插值）
@@ -236,8 +332,7 @@ def main_process(file_tuple):
         data["speed"] = data["speed"].astype("float[pyarrow]")
         data["dist_center"] = data["dist_center"].astype("float[pyarrow]")
     except Exception as trans_e:
-        # 如果转换失败，程序继续运行，但保持原类型
-        logger.warning(f"类型转换警告: {trans_e}")
+        logger.warning(f"类型转换警告: {trans_e}")  # 如果转换失败，程序继续运行，但保持原类型
     data.to_parquet(outfile_0, engine="pyarrow", compression="zstd", index=False)
 
     # 2. 按小时打断记录
@@ -246,90 +341,18 @@ def main_process(file_tuple):
         data_expanded["staytime"] = data_expanded["staytime"].astype("float[pyarrow]")
         data_expanded["hour"] = data_expanded["hour"].astype("int16[pyarrow]")
     except Exception as trans_e:
-        # 如果转换失败，程序继续运行，但保持原类型
-        logger.warning(f"类型转换警告: {trans_e}")
+        logger.warning(f"类型转换警告: {trans_e}")  # 如果转换失败，程序继续运行，但保持原类型
     data_expanded.to_parquet(outfile_a, engine="pyarrow", compression="zstd", index=False)
 
     # 3. 时间插值
-    # 步骤1: 每个用户在每个小时内，只保留即精度最高且时间最长的代表点
-    data_sorted = data_expanded.sort_values(by=["Userid", "hour", "priority", "staytime"],
-                                            ascending=[True, True, False, False])  # 场景 > wifi > 定位
-    data = data_sorted.drop_duplicates(subset=["Userid", "hour"], keep="first").reset_index(drop=True)
+    data_result = interpolate_data(data_expanded, day_str)
+    try:
+        numeric_cols = ["lng", "lat", "x", "y"]  # 将四列核心空间坐标统一转换为指定精度的 PyArrow 浮点数
+        data_result = data_result.astype({col: "float[pyarrow]" for col in numeric_cols})
+    except Exception as trans_e:
+        logger.warning(f"类型转换警告: {trans_e}")  # 如果转换失败，程序继续运行，但保持原类型
+    data_result.to_parquet(outfile_b, engine="pyarrow", compression='zstd', index=False)
 
-    # 步骤2: 向量化创建完整小时骨架序列
-    all_users = data["Userid"].unique()
-    full_combinations = pd.MultiIndex.from_product([all_users, range(1, 25)], names=["Userid", "hour"]).to_frame(
-        index=False
-    ).astype({
-        "Userid": "string[pyarrow]",
-        "hour": "int16[pyarrow]"
-    })
-
-    # 步骤3: 合并完整骨架序列与实际数据
-    merged = pd.merge(
-        full_combinations,
-        data[["Userid", "hour", "lng", "lat", "x", "y"]],
-        on=["Userid", "hour"],
-        how="left",
-    )
-    # 在执行线性插值前，如果经纬度缺失，说明该小时是新填充的骨架（即属于插值数据）
-    merged["is_moving"] = merged["lng"].isna().astype("bool[pyarrow]")
-
-    # 步骤4: 向量化插值处理（替代原始lambda方法）
-    # 构造辅助列记录有观测的小时
-    observed_hour = pd.Series(
-        np.where(~merged["is_moving"], merged["hour"], np.nan),
-        index=merged.index
-    )
-
-    # 对局部 Series 执行分组前向/后向填充
-    grp = merged.groupby("Userid")  # 全局分组对象
-    last_hour = observed_hour.groupby(merged["Userid"]).ffill()
-    next_hour = observed_hour.groupby(merged["Userid"]).bfill()
-
-    # 计算插值权重
-    denom = next_hour - last_hour
-    denom_safe = np.where(denom == 0, 1.0, denom)  # 防除以0
-    weight = (merged['hour'] - last_hour) / denom_safe
-
-    # 极速向量化计算 4 个数值列的线性插值
-    numeric_cols = ["lng", "lat", "x", "y"]
-    for col in numeric_cols:
-        last_val = grp[col].ffill()
-        next_val = grp[col].bfill()
-        merged[col] = last_val + weight * (next_val - last_val)
-
-    # 补齐两端边界空缺
-    merged[numeric_cols] = grp[numeric_cols].ffill()  # 补齐末观测之后
-    merged[numeric_cols] = merged.groupby("Userid")[numeric_cols].bfill()  # 补齐首观测之前
-
-    # 步骤5: 将经纬度转换为H3网格索引
-    # 提取唯一坐标并显式过滤空值
-    coords = merged[["lat", "lng"]].dropna(subset=["lat", "lng"]).drop_duplicates()
-    # 仅对极少数唯一坐标进行 H3 计算
-    coords["h3_grid"] = [
-        h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
-        for lat, lng in zip(coords["lat"].to_numpy(copy=False), coords["lng"].to_numpy(copy=False))
-    ]
-    # 构建 (lat, lng) -> h3_grid 的原生 Python 映射字典
-    h3_dict = dict(
-        zip(
-            zip(coords["lat"].to_numpy(copy=False), coords["lng"].to_numpy(copy=False)),
-            coords["h3_grid"].to_numpy(copy=False)
-        )
-    )
-    # 利用原生字典的 C 级哈希查找直接广播回大表，规避缓慢的 Pandas 浮点数 merge 关联
-    merged["h3_grid"] = [
-        h3_dict.get((lat, lng))
-        for lat, lng in zip(merged["lat"].to_numpy(copy=False), merged["lng"].to_numpy(copy=False))
-    ]
-
-    # 步骤6: 添加日期列并选择输出字段
-    merged["date"] = pd.to_datetime(day_str).date()
-    result = merged[["Userid", "date", "hour", "lng", "lat", "x", "y", "h3_grid", "is_moving"]]
-
-    # 保存结果
-    result.to_parquet(outfile_b, engine="pyarrow", compression='zstd', index=False)
     return
 
 
