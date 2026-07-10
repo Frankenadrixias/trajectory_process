@@ -47,8 +47,8 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
 OUTPUT_ROOT = r"H:\data_v4\厦门市"
-START_DATE = "2022-10-01"  # 起始日期
-END_DATE = "2022-10-01"  # 结束日期
+START_DATE = "2022-07-01"  # 起始日期
+END_DATE = "2022-09-30"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
@@ -71,10 +71,10 @@ transformer = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_proj4(albers_cr
 # 异常判别类
 @dataclass
 class JumpFilterParams:
-    speed_thresh_ms: float = 100  # 异常速度阈值 = 360km/h
+    speed_thresh_ms: float = 100  # 异常速度阈值 100m/s = 360km/h
     dist_thresh_m: float = 50000  # 位移阈值 = 50km
     far_thresh_m: float = 100000  # 远离中心阈值 = 100km
-    max_far_hours: float = 6  # 异常段最大持续时间 = 6h
+    max_far_hours: float = 3  # 异常段最大持续时间 = 4h
 
 
 # 返回 (start, end) 内部的整点时间列表
@@ -91,10 +91,12 @@ def get_split_points(start, end):
 
 
 # 基于运动特征 + 距离市中心的规则，按 Userid 识别并清洗剔除轨迹异常跳跃点
-# 返回：
-# - cleaned_df: 去除异常点后的DataFrame
-# - df: 含is_outlier标记的完整DataFrame
 def clean_user_track(df: pd.DataFrame, params: JumpFilterParams) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    :param df: 原始的data_v1数据DataFrame
+    :param params: 判断异常点的参数类
+    :return: cleaned_df: 去除异常点后的DataFrame, df: 含is_outlier标记的完整DataFrame
+    """
 
     # 1. 计算位移和速度
     group_obj = df.groupby("Userid", sort=False)
@@ -145,8 +147,10 @@ def clean_user_track(df: pd.DataFrame, params: JumpFilterParams) -> tuple[pd.Dat
     df["is_outlier"] = (df["point_outlier"] | df["far_outlier"]).fillna(False)
 
     # 返回清洗结果
-    drop_cols = ["dist", "speed", "point_outlier", "dist_center", "is_far", "far_seg", "far_outlier", "is_outlier"]
-    cleaned_df = df.loc[~df["is_outlier"]].drop(columns=drop_cols, errors="ignore")
+    drop_cols_1 = ["dist", "speed", "dist_center", "is_far", "far_seg"]
+    df.drop(columns=drop_cols_1, inplace=True)
+    drop_cols_2 = ["point_outlier", "far_outlier", "is_outlier"]
+    cleaned_df = df.loc[~df["is_outlier"]].drop(columns=drop_cols_2, errors="ignore")
 
     return cleaned_df, df
 
