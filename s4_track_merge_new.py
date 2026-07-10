@@ -48,7 +48,7 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
 OUTPUT_ROOT = r"H:\data_v4\厦门市"
 START_DATE = "2022-07-01"  # 起始日期
-END_DATE = "2022-09-30"  # 结束日期
+END_DATE = "2022-07-01"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
@@ -260,12 +260,12 @@ def interpolate_data(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
         how="left",
     )
     # 如果经度缺失，说明该小时是新填充的骨架（属于插值/移动中数据）
-    merged["is_moving"] = merged["lng"].isna().astype("bool[pyarrow]")
+    is_missing = merged["lng"].isna()
 
     # 步骤 4: 向量化时空约束线性插值
     # 构造内存级局部辅助 Series，记录原始有观测的小时
     observed_hour = pd.Series(
-        np.where(~merged["is_moving"], merged["hour"], np.nan),
+        np.where(~is_missing, merged["hour"], np.nan),
         index=merged.index
     )
 
@@ -312,7 +312,22 @@ def interpolate_data(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
         for lat, lng in zip(merged["lat"].to_numpy(copy=False), merged["lng"].to_numpy(copy=False))
     ]
 
-    # 步骤 6: 日期广播与字段格式化
+    # 步骤 6: 向量化计算最终的 is_moving
+    # 提取原始观测的 H3 网格（插值点设为 None）
+    original_h3 = merged["h3_grid"].where(~is_missing)
+
+    # 获取每个插值网格的前向已知 H3 和后向已知 H3
+    last_h3 = pd.Series(original_h3).groupby(merged["Userid"]).ffill()
+    next_h3 = pd.Series(original_h3).groupby(merged["Userid"]).bfill()
+
+    # 边界对齐：对于首尾两端的边界空缺，由于是平铺填充未发生位移，使其比对结果为一致（False）
+    last_h3_filled = last_h3.fillna(next_h3)
+    next_h3_filled = next_h3.fillna(last_h3)
+
+    # 判定最终的 is_moving：只有该时段是插值生成的（is_missing），且前后 H3 网格不一致时才标记为 True
+    merged["is_moving"] = (is_missing & (last_h3_filled != next_h3_filled)).astype("bool[pyarrow]")
+
+    # 步骤 7: 日期广播与字段格式化
     merged["date"] = pd.to_datetime(day_str).date()
     result = merged[["Userid", "date", "hour", "lng", "lat", "x", "y", "h3_grid", "is_moving"]]
 
@@ -332,11 +347,6 @@ def main_process(file_tuple):
 
     # 1. 去除异常点
     (data_cleaned, data) = clean_user_track(data, params=JumpFilterParams())
-    try:
-        data["speed"] = data["speed"].astype("float[pyarrow]")
-        data["dist_center"] = data["dist_center"].astype("float[pyarrow]")
-    except Exception as trans_e:
-        logger.warning(f"类型转换警告: {trans_e}")  # 如果转换失败，程序继续运行，但保持原类型
     data.to_parquet(outfile_0, engine="pyarrow", compression="zstd", index=False)
 
     # 2. 按小时打断记录
