@@ -5,7 +5,7 @@
 @Author  :   huangsh, FriedrichXR
 @Version :   2.0
 @Contact :   1126456109@qq.com，2249307370@qq.com
-@Desc    :   对同一天用户的轨迹进行空间聚类、按聚类进行合并，保留最长区间
+@Desc    :   将聚类、合并好的轨迹点去除异常点和跳跃点，并进行逐小时插值
 """
 import h3
 import warnings
