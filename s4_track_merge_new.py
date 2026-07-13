@@ -3,7 +3,7 @@
 @File    :   s4_track_merge_new.py
 @Time    :   2026/01/20 17:13
 @Author  :   huangsh, FriedrichXR
-@Version :   2.0
+@Version :   3.0
 @Contact :   1126456109@qq.com，2249307370@qq.com
 @Desc    :   将聚类、合并好的轨迹点去除异常点和跳跃点，并进行逐小时插值
 """
