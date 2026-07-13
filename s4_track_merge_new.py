@@ -47,15 +47,15 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
 OUTPUT_ROOT = r"H:\data_v4\厦门市"
-START_DATE = "2022-07-01"  # 起始日期
-END_DATE = "2022-07-01"  # 结束日期
+START_DATE = "2022-10-01"  # 起始日期
+END_DATE = "2022-12-31"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
 H3_RESOLUTION = 9
 MIN_VALID_HOURS = 5
 MAX_CPU_USAGE = 0.8  # 最大cpu使用比例 (90%)
-NUM_WORKERS = min(int(MAX_CPU_USAGE * cpu_count()), 12)  # 根据 CPU 核心数和内存设定进程数
+NUM_WORKERS = max(int(MAX_CPU_USAGE * cpu_count()), 12)  # 根据 CPU 核心数和内存设定进程数
 priority_map = {"wifi": 2, "scene": 3, "timing": 1}  # 数据类型权重表
 
 # 配置日志

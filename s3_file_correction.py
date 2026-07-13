@@ -16,9 +16,9 @@ from multiprocessing import cpu_count
 from tqdm import tqdm
 
 # ================ 配置数据 =================
-BASE_DIR = r"H:\data_v4测试\厦门市\Merge_v1"  # 输入路径
+BASE_DIR = r"H:\data_v4\厦门市\Merge_v1"  # 输入路径
 START_DATE = "2022-07-01"  # 起始日期
-END_DATE = "2022-07-02"  # 结束日期
+END_DATE = "2022-12-31"  # 结束日期
 MAX_CPU_USAGE = 0.9  # 最大cpu使用比例 (90%)
 NUM_WORKERS = int(MAX_CPU_USAGE * cpu_count())  # 根据 CPU 核心数和内存设定进程数
 priority_map = {"wifi": 2, "scene": 3, "timing": 1}  # 数据类型权重表
