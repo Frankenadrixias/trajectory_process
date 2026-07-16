@@ -50,11 +50,11 @@ F:/data_v4/北京24/Merge_v1/
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v0"
 OUTPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
-START_DATE = "2022-12-01"  # 起始日期
+START_DATE = "2022-07-01"  # 起始日期
 END_DATE = "2022-12-31"  # 结束日期
 
 # 参数配置
-NUM_WORKERS = 11  # 进程数
+NUM_WORKERS = 12  # 进程数
 GROUP_METHOD = "dbscan"  # 可选 "dbscan"（通过DBSCAN聚类plabel合并） 或 "h3"（直接按H3网格合并）
 H3_RESOLUTION = 9  # H3分辨率，可根据需要调整
 DBSCAN_MODEL = DBSCAN(eps=100, min_samples=2, algorithm="ball_tree", n_jobs=-1)  # DBSCAN参数

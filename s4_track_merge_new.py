@@ -8,6 +8,7 @@
 @Desc    :   将聚类、合并好的轨迹点去除异常点和跳跃点，并进行逐小时插值
 """
 import h3
+import gc
 import warnings
 import logging
 import numpy as np
@@ -46,16 +47,16 @@ F:/data_v4/北京24/Merge_v1a(Merge_v2a、Merge_v2b)/
 # ================ 配置数据 =================
 # 输入输出路径配置
 INPUT_DIR = r"H:\data_v4\厦门市\Merge_v1"
-OUTPUT_ROOT = r"H:\data_v4\厦门市"
-START_DATE = "2022-10-01"  # 起始日期
-END_DATE = "2022-12-31"  # 结束日期
+OUTPUT_ROOT = r"L:\data_v4\厦门市"
+START_DATE = "2022-10-31"  # 起始日期
+END_DATE = "2022-10-31"  # 结束日期
 # ========== 一般只需要修改以上内容 ==========
 
 # 参数配置
 H3_RESOLUTION = 9
 MIN_VALID_HOURS = 5
-MAX_CPU_USAGE = 0.8  # 最大cpu使用比例 (90%)
-NUM_WORKERS = max(int(MAX_CPU_USAGE * cpu_count()), 12)  # 根据 CPU 核心数和内存设定进程数
+MAX_CPU_USAGE = 0.6  # 最大cpu使用比例 (90%)
+NUM_WORKERS = min(int(MAX_CPU_USAGE * cpu_count()), 12)  # 根据 CPU 核心数和内存设定进程数
 priority_map = {"wifi": 2, "scene": 3, "timing": 1}  # 数据类型权重表
 
 # 配置日志
@@ -167,6 +168,10 @@ def hour_break(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
     df = df[(df["starttime"] < target_end) & (df["endtime"] >= target_start)].copy()
     if df.empty:
         return pd.DataFrame(columns=df.columns)
+
+    # 强制把时间起点和终点限制在 [target_start, target_end] 范围内
+    df["starttime"] = df["starttime"].clip(lower=target_start)
+    df["endtime"] = df["endtime"].clip(upper=target_end)
 
     # 3. 计算每个区间的起点和终点所在的整点
     s_hour = df["starttime"].dt.floor("h")
@@ -307,10 +312,9 @@ def interpolate_data(df: pd.DataFrame, day_str: str) -> pd.DataFrame:
         )
     )
     # 将结果广播回大表，彻底规避缓慢的 Pandas 浮点 merge 关联
-    merged["h3_grid"] = [
-        h3_dict.get((lat, lng))
-        for lat, lng in zip(merged["lat"].to_numpy(copy=False), merged["lng"].to_numpy(copy=False))
-    ]
+    merged["h3_grid"] = pd.Index(
+        zip(merged["lat"].to_numpy(copy=False), merged["lng"].to_numpy(copy=False))
+    ).map(h3_dict).astype("string[pyarrow]")
 
     # 步骤 6: 向量化计算最终的 is_moving
     # 提取原始观测的 H3 网格（插值点设为 None）
@@ -348,9 +352,13 @@ def main_process(file_tuple):
     # 1. 去除异常点
     (data_cleaned, data) = clean_user_track(data, params=JumpFilterParams())
     data.to_parquet(outfile_0, engine="pyarrow", compression="zstd", index=False)
+    del data
+    gc.collect()
 
     # 2. 按小时打断记录
     data_expanded = hour_break(data_cleaned, day_str)
+    del data_cleaned
+    gc.collect()
     try:
         data_expanded["staytime"] = data_expanded["staytime"].astype("float[pyarrow]")
         data_expanded["hour"] = data_expanded["hour"].astype("int16[pyarrow]")
@@ -360,6 +368,8 @@ def main_process(file_tuple):
 
     # 3. 时间插值
     data_result = interpolate_data(data_expanded, day_str)
+    del data_expanded
+    gc.collect()
     try:
         numeric_cols = ["lng", "lat", "x", "y"]  # 将四列核心空间坐标统一转换为指定精度的 PyArrow 浮点数
         data_result = data_result.astype({col: "float[pyarrow]" for col in numeric_cols})
