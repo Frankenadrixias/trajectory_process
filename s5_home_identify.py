@@ -47,8 +47,8 @@ NIGHT_START = 22  # 夜间起始小时
 NIGHT_END = 6  # 夜间结束小时 (不含)
 DAY_START = 10  # 白天起始小时
 DAY_END = 18  # 白天结束小时 (不含)
-NIGHT_DOMINANCE_RATIO = 0.6  # 夜间主位置占比阈值 (主位置次数 / 总夜间次数)
-WORK_DOMINANCE_RATIO = 0.4  # 工作时间主位置占比阈值 (主位置次数 / 总日间次数)
+NIGHT_DOMINANCE_RATIO = 0  # 夜间主位置占比阈值 (主位置次数 / 总夜间次数)
+WORK_DOMINANCE_RATIO = 0  # 工作时间主位置占比阈值 (主位置次数 / 总日间次数)
 TOP_NUM = 5  # 保留前几位比例
 H3_RESOLUTION = 9  # H3 分辨率
 MAX_CPU_USAGE = 0.6  # 最大cpu使用比例 (90%)
@@ -65,6 +65,11 @@ work_neighbors = pd.DataFrame()
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# 设置绘图风格与中文支持
+sns.set_theme(style="whitegrid", font='SimHei')
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
 
 
 # ================= 功能函数 =================
@@ -92,7 +97,7 @@ def build_h3_set(shape_path, resolution: int = H3_RESOLUTION):
         # 在 v4 中，Polygon 类通常被命名为 LatLngPoly，如果 h3.LatLngPoly 还报错说明安装可能不完整
         LatLngPoly = h3.LatLngPoly
     except AttributeError:
-        from h3.api.basic_str import LatLngPoly   # 备选方案：尝试直接从底层模块调用
+        from h3.api.basic_str import LatLngPoly  # 备选方案：尝试直接从底层模块调用
 
     # 执行填充：containment_mode=2 是“与边界相交”模式 (Intersects)
     # 如果版本不支持该参数，可删去，默认是中心点包含模式
@@ -342,16 +347,10 @@ def identify_residents_by_group(src_root, dst_root, h3_pkl_path):
     return final_residents_df
 
 
-def plot_top5_ratios_boxplot(df, save_path=None):
-    """绘制所有用户居住地和工作地前5网格占比的箱线图"""
-    # 设置支持中文的字体
-    plt.rcParams["font.sans-serif"] = [
-        "SimHei",
-        "Microsoft YaHei",
-        "DejaVu Sans",
-    ]
-    plt.rcParams["axes.unicode_minus"] = False
+# 绘制所有用户居住地和工作地前几网格占比的箱线图
+def plot_top5_ratios_boxplot(residents_path, save_path=None):
 
+    df = pd.read_parquet(residents_path, engine="pyarrow", dtype_backend="pyarrow")
     # 准备列名
     home_cols = [f"home_top{i}_ratio" for i in range(1, 6)]
     work_cols = [f"work_top{i}_ratio" for i in range(1, 6)]
@@ -365,7 +364,7 @@ def plot_top5_ratios_boxplot(df, save_path=None):
         return
 
     # 创建并排子图
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True)
 
     # 1. 绘制居住地 Top 5 占比
     if has_home:
@@ -379,15 +378,7 @@ def plot_top5_ratios_boxplot(df, save_path=None):
         axes[0].set_ylabel("占比")
         axes[0].grid(axis="y", linestyle="--", alpha=0.7)
     else:
-        axes[0].text(
-            0.5,
-            0.5,
-            "无居住地数据",
-            ha="center",
-            va="center",
-            fontsize=14,
-            color="gray",
-        )
+        axes[0].text(0.5, 0.5, "无居住地数据", ha="center", va="center", fontsize=14, color="gray")
 
     # 2. 绘制工作地 Top 5 占比
     if has_work:
@@ -399,15 +390,7 @@ def plot_top5_ratios_boxplot(df, save_path=None):
         axes[1].set_xlabel("出现频次排名")
         axes[1].grid(axis="y", linestyle="--", alpha=0.7)
     else:
-        axes[1].text(
-            0.5,
-            0.5,
-            "无工作地数据",
-            ha="center",
-            va="center",
-            fontsize=14,
-            color="gray",
-        )
+        axes[1].text(0.5, 0.5, "无工作地数据", ha="center", va="center", fontsize=14, color="gray")
 
     plt.suptitle("常住人口出行锚点前 5 网格占比箱线图", fontsize=16, y=0.98)
     plt.tight_layout()
@@ -416,7 +399,6 @@ def plot_top5_ratios_boxplot(df, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         logger.info(f"箱线图已成功保存至: {save_path}")
-
     plt.show()
 
 
@@ -438,7 +420,6 @@ def init_worker(users_home_dataframe, home_path, work_path):
 
 # 提取到主程序中执行的预处理函数：提取网格的邻域缓存
 def prepare_neighbors_static(resident_df, dst_root):
-
     home_path = dst_root / "home_neighbors.feather"
     work_path = dst_root / "work_neighbors.feather"
 
@@ -676,5 +657,6 @@ def filter_groups_by_residents_parallel(src_root, dst_root):
 
 if __name__ == "__main__":
     # build_h3_set(shape_path=SHAPEFILE_PATH, resolution=8)  # 生成 H3 集合
-    # identify_residents_by_group(SRC_DIR, DST_DIR, H3_SET_PATH)  # 识别常住用户
-    filter_groups_by_residents_parallel(SRC_DIR, DST_DIR)  # 过滤出最终文件
+    identify_residents_by_group(SRC_DIR, DST_DIR, H3_SET_PATH)  # 识别常住用户
+    # plot_top5_ratios_boxplot(r"G:\data_v5.4\北京市\residents1.parquet", 'resident.png')
+    # filter_groups_by_residents_parallel(SRC_DIR, DST_DIR)  # 过滤出最终文件
